@@ -1,0 +1,608 @@
+"""Isolated yt-dlp helper. JSON requests on stdin; prefixed JSON events on stdout."""
+from __future__ import annotations
+
+import base64
+import json
+from itertools import islice
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+
+PREFIX = "LRCPLUS_YTDLP "
+
+if __package__:
+    from .captions import convert_caption_file, caption_style_warning
+    from .artwork import find_cover, embed_cover, search_terms
+    from .lyrics import find_lyrics
+else:
+    # Isolated Python excludes the script directory from its import path.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from captions import convert_caption_file, caption_style_warning
+    from artwork import find_cover, embed_cover, search_terms
+    from lyrics import find_lyrics
+
+
+def emit(event, **values):
+    print(PREFIX + json.dumps(dict(event=event, **values), ensure_ascii=True), flush=True)
+
+
+def validate_url(value):
+    value = str(value).strip()
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or any(c.isspace() for c in value):
+        raise ValueError("Paste a complete http:// or https:// URL for one video or audio track.")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("URLs containing login credentials are not supported.")
+    return value
+
+
+def identity(info):
+    return str(info.get("extractor_key") or info.get("extractor") or "") + ":" + str(info.get("id") or "")
+
+
+def single_track(info):
+    if not isinstance(info, dict) or "entries" in info or info.get("_type") in {"playlist", "multi_video"}:
+        raise ValueError("This operation requires one track. Use Load playlist to choose playlist entries.")
+    if info.get("is_live") or info.get("live_status") == "is_upcoming":
+        raise ValueError("Live and upcoming broadcasts are not supported. Choose a finished recording.")
+    if not info.get("id"):
+        raise ValueError("The URL did not resolve to an identifiable audio/video track.")
+    return info
+
+
+def tool_paths(config, *, require=False):
+    location = str(config.get("ffmpeg_location", "")).strip()
+    if location:
+        path = Path(location).expanduser()
+        folder = path if path.is_dir() else path.parent
+        ffmpeg = shutil.which("ffmpeg", path=str(folder))
+        ffprobe = shutil.which("ffprobe", path=str(folder))
+    else:
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if require and (not ffmpeg or not ffprobe):
+        raise ValueError("FFmpeg and ffprobe are required. Install FFmpeg + ffprobe in Settings > Dependencies, or select their folder in the plugin settings.")
+    runtime = str(config.get("js_runtime", "auto"))
+    if runtime not in {"auto", "deno", "node", "quickjs"}:
+        raise ValueError("Select Auto, Deno, Node, or QuickJS in the plugin settings.")
+    configured = str(config.get("js_path", "")).strip()
+    if configured and runtime == "auto":
+        raise ValueError("Choose a JavaScript runtime type when specifying its executable path.")
+    runtimes = {}
+    for name in ([runtime] if runtime != "auto" else ["deno", "node", "quickjs"]):
+        executable = configured or ("qjs" if name == "quickjs" else name)
+        found = shutil.which(str(Path(executable).expanduser()))
+        if found:
+            runtimes[name] = {"path": found}
+            if runtime == "auto":
+                break
+    if runtime != "auto" and not runtimes:
+        raise ValueError(f"The selected {runtime} executable was not found. Check the plugin settings.")
+    return {"ffmpeg": ffmpeg, "ffprobe": ffprobe, "js_runtimes": runtimes}
+
+
+class Logger:
+    def debug(self, message):
+        if not str(message).startswith("[debug]"):
+            emit("log", message=str(message)[:2000])
+
+    info = debug
+
+    def warning(self, message):
+        emit("log", message="Warning: " + str(message)[:2000])
+
+    def error(self, message):
+        emit("log", message=str(message)[:2000])
+
+
+def options(config):
+    tools = tool_paths(config)
+    values = {
+        "quiet": True, "no_warnings": False, "noprogress": True,
+        "noplaylist": True, "playlistend": 1, "extract_flat": "in_playlist",
+        "socket_timeout": 20, "retries": 2, "fragment_retries": 2,
+        "logger": Logger(), "js_runtimes": tools["js_runtimes"],
+        "cachedir": False, "windowsfilenames": True,
+    }
+    if tools["ffmpeg"]:
+        values["ffmpeg_location"] = str(Path(tools["ffmpeg"]).parent)
+    return values
+
+
+def metadata(info):
+    title, artist, album = search_terms(info)
+    return {
+        "identity": identity(info), "title": str(info.get("title") or info.get("id")),
+        "artist": str(info.get("artist") or info.get("uploader") or ""),
+        "duration": info.get("duration"), "url": str(info.get("webpage_url") or ""),
+        "album": str(info.get("album") or ""),
+        "lyrics_query": {"track": title, "artist": artist, "album": album, "duration": info.get("duration")},
+        "release_date": info.get("release_date"), "upload_date": info.get("upload_date"),
+    }
+
+
+def preview_audio_formats(info):
+    """Mirror m4a/bestaudio/best and bestaudio/best using yt-dlp's sorted formats."""
+    formats = info.get("formats") or info.get("requested_formats") or [info]
+    audible = [item for item in formats if item.get("acodec") and item["acodec"] != "none"]
+    audio_only = [item for item in audible if item.get("vcodec") == "none"]
+    m4a = [item for item in audible if item.get("ext") == "m4a"]
+    combined = [item for item in audible if item.get("vcodec") not in {None, "none"}]
+    result = {}
+    for codec, candidates in (("m4a", m4a or audio_only or combined), ("mp3", audio_only or combined)):
+        if candidates:
+            result[codec] = {key: candidates[-1].get(key) for key in
+                             ("acodec", "abr", "asr", "tbr", "filesize", "filesize_approx")}
+    return result
+
+
+def subtitle_tracks(info):
+    tracks = []
+    for kind, key in (("manual", "subtitles"), ("auto", "automatic_captions")):
+        for language, formats in sorted((info.get(key) or {}).items()):
+            supported = [item for item in formats if item.get("ext") in {"vtt", "srt"}]
+            if language == "live_chat" or not supported:
+                continue
+            name = next((item.get("name") for item in supported if item.get("name")), language)
+            tracks.append({"language": language, "kind": kind, "name": str(name)})
+    return tracks
+
+
+def ass_subtitle_tracks(info):
+    return [{"language": language, "kind": kind}
+            for kind, key in (("manual", "subtitles"), ("auto", "automatic_captions"))
+            for language, formats in (info.get(key) or {}).items()
+            if any(str(item.get("ext", "")).lower() in {"ass", "ssa"} for item in formats)]
+
+
+def subtitle_options(request):
+    selected = request.get("subtitle")
+    if not selected:
+        return {}
+    if (not isinstance(selected, dict) or selected.get("kind") not in {"manual", "auto"}
+            or not isinstance(selected.get("language"), str) or not selected["language"]):
+        raise ValueError("Select a subtitle language and caption source.")
+    return {"writesubtitles": selected["kind"] == "manual", "writeautomaticsub": selected["kind"] == "auto",
+            "subtitleslangs": [re.escape(selected["language"])], "subtitlesformat": "vtt/srt"}
+
+
+def validate_subtitle(info, request):
+    selected = request.get("subtitle")
+    if selected and not any(track["language"] == selected["language"] and track["kind"] == selected["kind"]
+                            for track in subtitle_tracks(info)):
+        raise ValueError("The selected subtitles are no longer available. Preview the URL again.")
+
+
+def preview(url, config, *, musicbrainz_not_before=0):
+    from yt_dlp import YoutubeDL
+
+    with YoutubeDL(options(config)) as ydl:
+        info = single_track(ydl.extract_info(validate_url(url), download=False))
+        result = metadata(info)
+        result["audio_formats"] = preview_audio_formats(info)
+        result["subtitle_tracks"] = subtitle_tracks(info)
+        result["ass_subtitle_tracks"] = ass_subtitle_tracks(info)
+        if config.get("use_musicbrainz_cover", False):
+            emit("processing", message="Looking for an album cover on MusicBrainz…")
+            try:
+                time.sleep(max(0, min(1.1, musicbrainz_not_before - time.time())))
+                cover = find_cover(info)
+                if cover:
+                    result["thumbnail"] = cover.pop("data")
+                    result["musicbrainz_cover"] = cover
+                    return result
+                result["artwork_message"] = "No reliable MusicBrainz cover found; using source artwork."
+            except Exception as error:
+                result["artwork_message"] = "MusicBrainz artwork unavailable; using source artwork."
+                emit("log", message="MusicBrainz artwork lookup failed: " + str(error)[:500])
+        thumbnail = info.get("thumbnail")
+        if thumbnail and urlsplit(thumbnail).scheme in {"http", "https"}:
+            try:
+                with ydl.urlopen(thumbnail) as response:
+                    data = response.read(2_000_001)
+                if len(data) <= 2_000_000:
+                    result["thumbnail"] = base64.b64encode(data).decode("ascii")
+            except Exception:
+                pass  # Artwork preview must not prevent importing audio.
+        return result
+
+
+def search(query, config):
+    """Fetch a bounded YouTube result list without extracting audio formats."""
+    from yt_dlp import YoutubeDL
+    from yt_dlp.networking import Request
+
+    query = str(query).strip()
+    if not query or len(query) > 500:
+        raise ValueError("Enter a YouTube search of 1 to 500 characters.")
+    values = options(config)
+    values.update(playlistend=10, extract_flat=True, skip_download=True,
+                  ignoreerrors=True)
+    results = []
+    with YoutubeDL(values) as ydl:
+        info = ydl.extract_info("ytsearch10:" + query, download=False)
+        if not isinstance(info, dict):
+            raise ValueError("YouTube search failed. Please try again.")
+        for entry in islice(info.get("entries") or [], 10):
+            if not isinstance(entry, dict):
+                continue
+            video_id = str(entry.get("id") or "")
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+                    or entry.get("is_live") or entry.get("live_status") in {"is_live", "is_upcoming"}):
+                continue
+            result = {"url": "https://www.youtube.com/watch?v=" + video_id,
+                      "title": str(entry.get("title") or video_id),
+                      "artist": str(entry.get("channel") or entry.get("uploader") or ""),
+                      "duration": entry.get("duration")}
+            thumbnails = entry.get("thumbnails") or []
+            thumbnail = entry.get("thumbnail") or next(
+                (item.get("url") for item in thumbnails if item.get("url")), None)
+            if thumbnail and urlsplit(thumbnail).scheme in {"http", "https"}:
+                try:
+                    with ydl.urlopen(Request(thumbnail, extensions={"timeout": 3})) as response:
+                        data = response.read(120_001)
+                    if len(data) <= 120_000:
+                        result["thumbnail"] = base64.b64encode(data).decode("ascii")
+                except Exception:
+                    pass  # Missing artwork must not hide a search result.
+            results.append(result)
+            emit("search_result", result=result)
+    return {"results": results}
+
+
+def playlist(url, config, *, start=1, count=100):
+    """Read one bounded page without downloading or resolving every track."""
+    from yt_dlp import YoutubeDL
+
+    start, count = max(1, int(start)), max(1, min(100, int(count)))
+    values = options(config)
+    values.update(noplaylist=False, extract_flat=True, skip_download=True,
+                  ignoreerrors=True, lazy_playlist=True, playliststart=start,
+                  playlistend=start + count)
+    results = []
+    with YoutubeDL(values) as ydl:
+        info = ydl.extract_info(validate_url(url), download=False)
+        if not isinstance(info, dict) or "entries" not in info:
+            raise ValueError("This URL did not resolve to a playlist.")
+        entries = list(islice(info.get("entries") or [], count + 1))
+        for offset, entry in enumerate(entries[:count]):
+            index = start + offset
+            if not isinstance(entry, dict):
+                results.append({"title": f"Unavailable track {index}", "available": False, "index": index})
+                continue
+            entry_url = entry.get("webpage_url") or entry.get("url")
+            if entry.get("ie_key") == "Youtube" or str(info.get("extractor_key", "")).startswith("Youtube"):
+                video = str(entry.get("id") or "")
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", video):
+                    entry_url = "https://www.youtube.com/watch?v=" + video
+            try:
+                entry_url = validate_url(entry_url or "")
+                available = not (entry.get("is_live") or entry.get("live_status") in {"is_live", "is_upcoming"}
+                                 or entry.get("availability") in {"private", "premium_only", "subscriber_only", "needs_auth"}
+                                 or entry.get("_type") in {"playlist", "multi_video"})
+            except ValueError:
+                entry_url, available = "", False
+            results.append({"url": entry_url, "title": str(entry.get("title") or f"Track {index}"),
+                            "artist": str(entry.get("uploader") or entry.get("channel") or ""),
+                            "duration": entry.get("duration"), "available": available, "index": index})
+    return {"title": str(info.get("title") or "Playlist"), "results": results,
+            "next_start": start + count if len(entries) > count else None}
+
+
+def publish_bundle(stem, files, destination):
+    """Publish matching files together, rolling back collisions without overwrites."""
+    destination = Path(destination)
+    for number in range(1, 10001):
+        suffix = "" if number == 1 else f" ({number})"
+        created = []
+        try:
+            result = {}
+            for extension, source in files.items():
+                source = Path(source)
+                target = destination / (stem + suffix + extension)
+                moved = False
+                try:
+                    os.link(source, target)
+                except FileExistsError:
+                    raise
+                except OSError:
+                    if os.name != "nt":
+                        raise
+                    source.rename(target)  # Windows rename refuses overwrites.
+                    moved = True
+                created.append((source, target, moved))
+                result[extension] = target
+            return result
+        except OSError as error:
+            collision = isinstance(error, FileExistsError)
+            for source, target, moved in reversed(created):
+                if moved:
+                    target.rename(source)
+                else:
+                    target.unlink()
+            if not collision:
+                raise
+    raise ValueError("Too many downloads have the same filename. Choose another folder.")
+
+
+def publish_download(source, destination):
+    source = Path(source)
+    return publish_bundle(source.stem, {source.suffix: source}, destination)[source.suffix]
+
+
+def collect_subtitles(info, request, stage):
+    selected = request.get("subtitle")
+    if not selected:
+        return {}, {}
+    caption = (info.get("requested_subtitles") or {}).get(selected["language"], {})
+    if caption.get("filepath"):
+        source = Path(caption["filepath"]).resolve()
+    else:
+        # Some processed format snapshots omit requested_subtitles. Only one
+        # language/format was requested, and this staging directory is private
+        # to the operation, so its single VTT/SRT is unambiguous.
+        candidates = [path.resolve() for path in stage.iterdir()
+                      if path.suffix.lower() in {".vtt", ".srt"} and path.is_file()]
+        if len(candidates) != 1:
+            raise ValueError("The selected subtitle file was not downloaded successfully.")
+        source = candidates[0]
+    if not source.is_relative_to(stage) or not source.is_file() or source.suffix.lower() not in {".vtt", ".srt"}:
+        raise ValueError("The selected subtitle file was not downloaded successfully.")
+    files = {source.suffix.lower(): source}
+    result = {"subtitle": dict(selected), "subtitle_extension": source.suffix.lower()}
+    style_warning = caption_style_warning(source.read_text(encoding="utf-8-sig", errors="replace"))
+    if style_warning:
+        result["subtitle_warning"] = style_warning
+        emit("subtitle_warning", message=style_warning)
+    if request.get("subtitles_as_lyrics", True):
+        lyrics = stage / "converted-captions.lrc"
+        try:
+            convert_caption_file(source, lyrics, automatic=selected["kind"] == "auto")
+            files[".lrc"] = lyrics
+        except (OSError, ValueError) as error:
+            result["warning"] = "Subtitles saved, but synced lyrics could not be created: " + str(error)
+    return files, result
+
+
+def subtitle_result(result, published, *, prefix=""):
+    if "subtitle" not in result:
+        return result
+    result["subtitle_path"] = str(published[prefix + result.pop("subtitle_extension")])
+    if prefix + ".lrc" in published:
+        result["lyrics_path"] = str(published[prefix + ".lrc"])
+    return result
+
+
+def checked_stage(request):
+    stage = Path(request["stage"]).resolve()
+    destination = Path(request["folder"]).expanduser().resolve()
+    if stage.parent != destination or not stage.name.startswith(".lrcplus-import-") or not stage.is_dir():
+        raise ValueError("Invalid download staging directory.")
+    return stage, destination
+
+
+def caption_suffix(selected):
+    language = re.sub(r"[^a-zA-Z0-9_.-]", "_", selected["language"])[:64]
+    return "." + language + "." + selected["kind"]
+
+
+def collect_automatic_lyrics(info, request, stage, files, details, *, audio=None):
+    if not request.get("config", {}).get("automatically_find_lyrics", False):
+        return
+    if any(extension.endswith((".lrc", ".lrcx")) for extension in files):
+        return  # Explicitly selected subtitle lyrics take precedence.
+    if audio is not None:
+        saved = request.get("existing_lyrics_path")
+        candidates = ([Path(saved)] if saved else []) + [audio.with_suffix(ext) for ext in (".lrcx", ".lrc", ".txt")]
+        for path in candidates:
+            if path.suffix.lower() in {".lrcx", ".lrc", ".txt"} and path.is_file():
+                details.update(lyrics_path=str(path), lyrics_source="existing",
+                               lyrics_message="Kept existing lyrics.")
+                return
+    emit("processing", message="Looking for lyrics on LRCLIB…")
+    try:
+        match = find_lyrics(info)
+        if match is None:
+            details["lyrics_message"] = "No reliable lyrics match found on LRCLIB."
+            return
+        extension = match["extension"]
+        path = stage / ("found-lyrics" + extension)
+        path.write_text(match["text"], encoding="utf-8")
+        files[extension] = path
+        details.update(lyrics_extension=extension, lyrics_source="LRCLIB",
+                       lyrics_message="Found " + ("synced" if extension == ".lrc" else "plain") + " lyrics on LRCLIB.")
+    except Exception as error:
+        details["lyrics_message"] = "Automatic lyrics lookup failed; audio is still available."
+        emit("log", message="LRCLIB lyrics lookup failed: " + str(error)[:500])
+
+
+def automatic_lyrics_result(details, published):
+    extension = details.pop("lyrics_extension", None)
+    if extension:
+        details["lyrics_path"] = str(published[extension])
+    return details
+
+
+def find_existing_audio_lyrics(request):
+    stage, destination = checked_stage(request)
+    audio = Path(request["audio_path"]).resolve()
+    if audio.parent != destination or not audio.is_file() or audio.suffix.lower() not in {".m4a", ".mp3"}:
+        raise ValueError("The existing audio file is unavailable.")
+    files, details = {}, {}
+    info = request.get("info", {})
+    collect_automatic_lyrics(info.get("lyrics_query", info), request, stage, files, details, audio=audio)
+    published = publish_bundle(audio.stem, files, destination) if files else {}
+    return dict(path=str(audio), **automatic_lyrics_result(details, published))
+
+
+def download_subtitles(request):
+    from yt_dlp import YoutubeDL
+
+    stage, destination = checked_stage(request)
+    audio = Path(request["audio_path"]).resolve()
+    if audio.parent != destination or not audio.is_file() or audio.suffix.lower() not in {".m4a", ".mp3"}:
+        raise ValueError("The existing audio file is unavailable.")
+    if not request.get("subtitle"):
+        raise ValueError("Select subtitles to download.")
+    opts = options(request["config"])
+    opts.update(subtitle_options(request))
+    opts.update(skip_download=True, outtmpl=str(stage / "captions.%(ext)s"))
+    with YoutubeDL(opts) as ydl:
+        info = single_track(ydl.extract_info(validate_url(request["url"]), download=False))
+        if identity(info) != request["identity"]:
+            raise ValueError("The URL now points to a different track. Preview it again.")
+        validate_subtitle(info, request)
+        processed = ydl.process_ie_result(info, download=True)
+    files, details = collect_subtitles(processed or info, request, stage)
+    prefix = caption_suffix(request["subtitle"])
+    files = {prefix + extension: path for extension, path in files.items()}
+    collect_automatic_lyrics(info, request, stage, files, details, audio=audio)
+    published = publish_bundle(audio.stem, files, destination)
+    subtitle_result(details, published, prefix=prefix)
+    return dict(metadata(info), path=str(audio), **automatic_lyrics_result(details, published))
+
+
+def download(request):
+    from yt_dlp import YoutubeDL
+    from yt_dlp.postprocessor import PostProcessor
+
+    config = request["config"]
+    tool_paths(config, require=True)
+    stage, destination = checked_stage(request)
+    codec = request.get("codec", "m4a")
+    if codec not in {"m4a", "mp3"}:
+        raise ValueError("Select M4A or MP3 audio.")
+    captured = []
+
+    class CaptureFinalFile(PostProcessor):
+        def run(self, info):
+            captured.append(info)
+            return [], info
+
+    last_progress = 0.0
+
+    def progress(data):
+        nonlocal last_progress
+        now = time.monotonic()
+        if data.get("status") == "finished":
+            emit("processing", message="Converting audio and embedding metadata…")
+        elif now - last_progress >= 0.15:
+            last_progress = now
+            emit("progress", downloaded=data.get("downloaded_bytes", 0),
+                 total=data.get("total_bytes") or data.get("total_bytes_estimate"),
+                 speed=data.get("speed"), eta=data.get("eta"))
+
+    opts = options(config)
+    opts.update(subtitle_options(request))
+    opts.update({
+        "format": "m4a/bestaudio/best" if codec == "m4a" else "bestaudio/best",
+        "outtmpl": str(stage / "%(title).140B [%(id)s].%(ext)s"),
+        "writethumbnail": True, "overwrites": False,
+        "progress_hooks": [progress],
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": codec, "preferredquality": "192"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
+            {"key": "EmbedThumbnail"},
+        ],
+    })
+    with YoutubeDL(opts) as ydl:
+        info = single_track(ydl.extract_info(validate_url(request["url"]), download=False))
+        if identity(info) != request["identity"]:
+            raise ValueError("The URL now points to a different track. Preview it again before downloading.")
+        validate_subtitle(info, request)
+        ydl.add_post_processor(CaptureFinalFile(ydl), when="after_move")
+        ydl.process_ie_result(info, download=True)
+    if len(captured) != 1:
+        raise ValueError("The downloader did not produce one completed audio file.")
+    source = Path(captured[0]["filepath"]).resolve()
+    if not source.is_relative_to(stage) or not source.is_file() or source.suffix != "." + codec:
+        raise ValueError("The downloader returned an invalid audio file.")
+    caption_files, details = collect_subtitles(captured[0], request, stage)
+    cover = request.get("musicbrainz_cover") if config.get("use_musicbrainz_cover", False) else None
+    if cover:
+        try:
+            embed_cover(source, cover)
+            details["musicbrainz_cover"] = {key: cover[key] for key in ("release_id", "album")}
+        except Exception as error:
+            warning = "Could not embed MusicBrainz cover; kept source artwork: " + str(error)[:500]
+            details["warning"] = "\n".join(filter(None, (details.get("warning"), warning)))
+            emit("log", message=warning)
+    prefix = caption_suffix(request["subtitle"]) if request.get("subtitle") else ""
+    # Publish sidecars before the audio; audio becomes visible only when all
+    # selected outputs have been written. Collisions keep a shared basename.
+    files = {prefix + extension: path for extension, path in caption_files.items()}
+    collect_automatic_lyrics(info, request, stage, files, details)
+    files[source.suffix] = source
+    published = publish_bundle(source.stem, files, destination)
+    subtitle_result(details, published, prefix=prefix)
+    return dict(metadata(info), path=str(published[source.suffix]), **automatic_lyrics_result(details, published))
+
+
+def check_setup(config):
+    from yt_dlp.version import __version__
+
+    tools = tool_paths(config)
+    lines = [f"yt-dlp {__version__}"]
+    for name in ("ffmpeg", "ffprobe"):
+        path = tools[name]
+        lines.append(f"{name}: {path or 'not found'}")
+        if path:
+            result = subprocess.run([path, "-version"], capture_output=True, timeout=8,
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode:
+                raise ValueError(f"{name} could not run. Check its installation.")
+    if not tools["js_runtimes"]:
+        lines.append("JavaScript runtime: not found. Install Deno in Settings > Dependencies for YouTube support.")
+    for name, value in tools["js_runtimes"].items():
+        result = subprocess.run([value["path"], "--version"], capture_output=True, timeout=8,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        version = result.stdout.decode("utf-8", "replace").splitlines()
+        lines.append(f"{name}: {version[0] if version else value['path']}")
+    try:
+        import yt_dlp_ejs  # noqa: F401
+        lines.append("YouTube challenge scripts: installed")
+    except ImportError:
+        lines.append("YouTube challenge scripts: missing. Install/repair yt-dlp[default] in Settings > Dependencies, then restart.")
+    return {"message": "\n".join(lines)}
+
+
+def main():
+    site = os.environ.get("LRCPLUS_DEPENDENCY_SITE")
+    if site and site not in sys.path:
+        sys.path.append(site)
+    if os.name != "nt":
+        os.setsid()  # Cancellation can stop the downloader and converter together.
+    try:
+        request = json.load(sys.stdin)
+        action = request["action"]
+        if action == "search":
+            result = search(request["query"], request["config"])
+        elif action == "playlist":
+            result = playlist(request["url"], request["config"], start=request.get("start", 1))
+        elif action == "preview":
+            result = preview(request["url"], request["config"],
+                             musicbrainz_not_before=request.get("musicbrainz_not_before", 0))
+        elif action == "download":
+            result = download(request)
+        elif action == "subtitles":
+            result = download_subtitles(request)
+        elif action == "lyrics":
+            result = find_existing_audio_lyrics(request)
+        elif action == "check":
+            result = check_setup(request["config"])
+        else:
+            raise ValueError("Unknown downloader operation.")
+        emit("result", result=result)
+        return 0
+    except Exception as error:
+        emit("error", message=str(error)[:4000])
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
