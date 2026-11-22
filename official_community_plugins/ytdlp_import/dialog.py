@@ -277,7 +277,19 @@ class ImportDialog(QDialog):
         layout.addWidget(self.automatically_find_lyrics)
         layout.addWidget(self.add_to_queue)
         layout.addWidget(self.progress)
-        layout.addWidget(self.status)
+        if self.download_queue is None:
+            layout.addWidget(self.status)
+        else:
+            status_row = QHBoxLayout()
+            status_row.addWidget(self.status, 1)
+            self.view_downloads_button = QPushButton("View downloads")
+            self.view_downloads_button.setAutoDefault(False)
+            self.view_downloads_button.clicked.connect(lambda: self.tabs.setCurrentWidget(self.queue_view))
+            self.view_downloads_button.hide()
+            status_row.addWidget(self.view_downloads_button)
+            layout.addLayout(status_row)
+            self.download_queue.changed.connect(self._update_downloads_tab)
+            self._update_downloads_tab()
         layout.addWidget(self.details)
         layout.addLayout(buttons)
         self._fit_content()
@@ -429,11 +441,26 @@ class ImportDialog(QDialog):
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
             return False
-        self.status.setText(f"Added {count} track(s) to downloads. Already queued tracks were skipped.")
         if count:
-            self.download_queue.set_paused(False)
-            self.tabs.setCurrentIndex(1)
+            message = "Added 1 track to downloads." if count == 1 else f"Added {count} tracks to downloads."
+            if count < len(entries):
+                message += " Skipped tracks already in the queue."
+            if self.download_queue.paused:
+                message += " The download queue is paused."
+        else:
+            message = "The selected tracks are already in the download queue."
+        self.status.setText(message)
+        self.view_downloads_button.setVisible(bool(self.download_queue.items))
         return True
+
+    def _update_downloads_tab(self):
+        queue = self.download_queue
+        pending = len(queue.jobs) + sum(item["state"] == "waiting" and item["id"] not in queue.jobs
+                                        for item in queue.items)
+        title = f"Downloads ({pending})" if pending else "Downloads"
+        self.tabs.setTabText(self.tabs.indexOf(self.queue_view), title)
+        if not queue.items:
+            self.view_downloads_button.hide()
 
     def _enqueue_selected(self):
         entries = [self.search_results.item(index).data(Qt.ItemDataRole.UserRole + 1)
@@ -497,15 +524,7 @@ class ImportDialog(QDialog):
         if self.job is not None:
             return
         if not self._is_url():
-            query = self.url.text().strip()
-            if not query or len(query) > 500:
-                self.status.setText("Enter a YouTube search of 1 to 500 characters, or paste a URL.")
-                return
-            self._url_changed()
-            self.search_results.clear()
-            self.search_results.hide()
-            self.url.remember_search()
-            self._start("search")
+            self.search_youtube(self.url.text())
             return
         try:
             self.preview_url = validate_url(self.url.text())
@@ -517,6 +536,24 @@ class ImportDialog(QDialog):
         self._refresh_preview_metadata()
         self.url.remember_search()
         self._start("preview")
+
+    def search_youtube(self, query):
+        if self.job is not None:
+            return False
+        query = query.strip()
+        if not query or len(query) > 500:
+            self.status.setText("Enter a YouTube search of 1 to 500 characters, or paste a URL.")
+            return False
+        if self.download_queue is not None:
+            self.tabs.setCurrentIndex(0)
+        self.url.setText(query)
+        self.preview_button.setText("Search")
+        self._url_changed()
+        self.search_results.clear()
+        self.search_results.hide()
+        self.url.remember_search()
+        self._start("search")
+        return True
 
     def _history_key(self):
         return self.info["identity"] + ":" + self.codec.currentData() if self.info else None
